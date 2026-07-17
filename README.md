@@ -35,7 +35,7 @@ python chatgpt.py --yes -w 3 -n 5  # 非交互
 
 ```bash
 cp .env.example .env && chmod 600 .env
-# OEP_BASE_URL=http://host.docker.internal:5001
+# OEP_BASE_URL=http://outlook-email-plus:5000
 # OEP_API_KEY=...
 mkdir -p keys && chmod 700 keys
 
@@ -47,7 +47,7 @@ docker compose --profile tools run --rm gptsignup --yes -w 3 -n 1
 
 | 变量 | 说明 |
 |------|------|
-| `OEP_BASE_URL` | Outlook Email Plus 根地址 |
+| `OEP_BASE_URL` | Outlook Email Plus 根地址；同机 Docker 用 `http://outlook-email-plus:5000` |
 | `OEP_API_KEY` | 对外 API Key（`X-API-Key`） |
 | `OEP_PROVIDER` | 池筛选，默认 `outlook`；勿用 `cloudflare_temp_mail` |
 | `OEP_PROJECT_KEY` | 项目隔离 key，默认 `gptsignup` |
