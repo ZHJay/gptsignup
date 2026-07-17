@@ -1,0 +1,4 @@
+curl_cffi
+python-dotenv
+requests
+beautifulsoup4

@@ -1,0 +1,27 @@
+# 环境配置
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 输出与密钥
+keys/
+tokens/
+registered_accounts*.txt
+*.log
+
+# 服务器部署标记（本机不提交）
+.deployed-revision
+.deployed-at

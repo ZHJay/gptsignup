@@ -1,0 +1,24 @@
+# Layer: L2 流程层（部署编排）
+# Contract: 构建 gptsignup 镜像；.env 与 keys 挂载在宿主机，不进 Git。
+# Boundary: 本服务是批处理工具，默认不常驻；用 `docker compose run` 执行任务。
+
+services:
+  gptsignup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gptsignup:latest
+    container_name: gptsignup
+    env_file:
+      - .env
+    environment:
+      # 可被 compose run -e 覆盖
+      GPT_WORKERS: ${GPT_WORKERS:-3}
+      GPT_TOTAL: ${GPT_TOTAL:-1}
+      PROXY: ${PROXY:-}
+    volumes:
+      - ./keys:/app/keys
+    # 批处理：不自动重启；镜像更新后下次 run 即用新版本
+    restart: "no"
+    profiles:
+      - tools
