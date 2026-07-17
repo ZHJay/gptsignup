@@ -1,6 +1,7 @@
 # Layer: L2 流程层（部署编排）
 # Contract: 构建 gptsignup 镜像；.env 与 keys 挂载在宿主机，不进 Git。
 # Boundary: 本服务是批处理工具，默认不常驻；用 `docker compose run` 执行任务。
+# Why: 通过 host-gateway 访问同机 Outlook Email Plus(127.0.0.1:5001)。
 
 services:
   gptsignup:
@@ -16,6 +17,8 @@ services:
       GPT_WORKERS: ${GPT_WORKERS:-3}
       GPT_TOTAL: ${GPT_TOTAL:-1}
       PROXY: ${PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./keys:/app/keys
     # 批处理：不自动重启；镜像更新后下次 run 即用新版本

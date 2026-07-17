@@ -98,7 +98,7 @@ def create_account(session, device_id: str, name: str, birthdate: str) -> Option
         msg = _snip(resp)
         if "registration_disallowed" in msg:
             raise RegistrationError(
-                "registration_disallowed：邮箱域名或 IP 被拒，换 MAIL_DOMAIN / 代理后重试。"
+                "registration_disallowed：邮箱域名或 IP 被拒，换 OEP 池内账号 / 代理后重试。"
                 f" raw={msg}"
             )
         raise RegistrationError(f"create_account HTTP {resp.status_code}: {msg}")

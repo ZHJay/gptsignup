@@ -56,8 +56,9 @@ class RegisterFlow:
 
     def register_one(self) -> RegisterResult:
         email = None
+        finished = False
         try:
-            _jwt, email = self.email_service.create_email()
+            _claim_token, email = self.email_service.create_email()
             if not email:
                 raise RegistrationError("create_email failed")
 
@@ -111,6 +112,14 @@ class RegisterFlow:
             if not access_token:
                 raise RegistrationError("empty accessToken from /api/auth/session")
 
+            # 注册成功：回写邮箱池 complete，供 project_key 复用路径
+            try:
+                self.email_service.complete_email(
+                    email, result="success", detail="chatgpt_registered"
+                )
+            except Exception:
+                pass
+            finished = True
             return RegisterResult(
                 email=email,
                 password=password,
@@ -118,7 +127,8 @@ class RegisterFlow:
                 device_id=self.device_id,
             )
         finally:
-            if email:
+            # 失败/中断：释放租约，避免邮箱卡在 claimed
+            if email and not finished:
                 try:
                     self.email_service.delete_email(email)
                 except Exception:

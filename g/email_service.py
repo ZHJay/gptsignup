@@ -1,13 +1,16 @@
 # Layer: L1 积木层
-# Contract: cloudflare_temp_email 创建/收码/删除。
-# Debt: 自 grokzhuce 整体迁入，298 行内聚邮箱能力暂不拆；若再增协议适配再按收码/管理拆分。
-# Remove when: 新增第二邮箱供应商或文件持续膨胀时。
-"""邮箱服务类 - 适配 cloudflare_temp_email"""
+# Contract: 经 Outlook Email Plus /api/external/* 领取邮箱、取验证码、释放/完成租约。
+# Boundary: 不直连 Cloudflare Temp Mail；上游契约固定为 X-API-Key + pool claim。
+# Why: 注册机只依赖邮箱池中台，避免自建 CF Worker 协议与密钥分叉。
+
+from __future__ import annotations
+
 import os
 import re
 import time
-import string
-import random
+import uuid
+from typing import Any
+
 import requests
 from dotenv import load_dotenv
 
@@ -17,286 +20,240 @@ def _looks_like_date(digits: str) -> bool:
         return False
     if len(digits) == 4:
         n = int(digits)
-        if 1900 <= n <= 2099:
-            return True
+        return 1900 <= n <= 2099
     if len(digits) == 8:
-        year = int(digits[:4])
-        month = int(digits[4:6])
-        day = int(digits[6:8])
-        if 1900 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31:
-            return True
+        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+        return 1900 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31
     return False
 
 
 def _normalize_mail_text(text: str) -> str:
-    """HTML 粗剥离，便于从邮件正文抽码。"""
     if not text:
         return ""
-    # 明显是 HTML 时去掉标签
     if "<" in text and ">" in text:
         text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
         text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
         text = re.sub(r"(?s)<[^>]+>", " ", text)
-        text = re.sub(r"&nbsp;", " ", text)
-        text = re.sub(r"&amp;", "&", text)
-        text = re.sub(r"&lt;", "<", text)
-        text = re.sub(r"&gt;", ">", text)
+        text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+        text = text.replace("&lt;", "<").replace("&gt;", ">")
     return re.sub(r"\s+", " ", text).strip()
 
 
-def extract_verification_code(text: str):
-    """从邮件主题/正文提取验证码。
-
-    兼容：
-    - 通用 verification code / 验证码 格式
-    - xAI: 主题 `UTF-6PW xAI confirmation code`，正文 code 在 confirm 关键词前
-    """
+def extract_verification_code(text: str) -> str | None:
+    """本地兜底抽码；主路径优先走 OEP verification-code。"""
     if not text:
         return None
-
     raw = text.strip()
     plain = _normalize_mail_text(text)
-
-    # xAI 主题/正文: "{CODE} xAI confirmation code"
-    for candidate in (raw, plain):
-        m = re.search(
-            r"(?i)\b([A-Z0-9][A-Z0-9-]{3,11})\s+xAI\s+confirmation\s+code\b",
-            candidate,
-        )
-        if m:
-            return m.group(1)
-
-    # xAI HTML: 大号加粗验证码
-    m = re.search(
-        r"(?is)font-weight\s*:\s*bold[^>]*>\s*([A-Za-z0-9][A-Za-z0-9-]{3,11})\s*<",
-        raw,
-    )
-    if m and re.search(r"\d", m.group(1)):
-        return m.group(1)
-
-    # xAI 正文: 在 "code below / email address" 后找带数字的短 token（如 UTF-6PW）
-    for m in re.finditer(
-        r"(?i)(?:use the code below|validate your email address)(.{0,160})",
-        plain,
-    ):
-        window = m.group(1)
-        for token in re.findall(r"\b([A-Za-z0-9][A-Za-z0-9-]{3,11})\b", window):
-            if not re.search(r"\d", token):
-                continue
-            if _looks_like_date(token.replace("-", "")):
-                continue
-            if token.lower() in {"address", "email", "below", "please", "thank", "create", "2026"}:
-                continue
-            return token
-
     delim = r"\s*(?:[:：]|\bis\b|是|为|です)[\s:：]*"
     cn_ja_ko_kw = r"验证码|认证码|确认码|認証コード|인증\s*코드|코드"
     en_kw = r"verification\s*code|confirm(?:ation)?\s*code|security\s*code|passcode|OTP|pin\s*code"
     all_kw = f"{cn_ja_ko_kw}|{en_kw}"
-
-    keyword_patterns = [
+    patterns = [
         re.compile(rf"\bcode{delim}(\d{{4,12}})\b", re.I),
         re.compile(rf"(?:{all_kw}){delim}(\d{{4,12}})\b", re.I),
         re.compile(rf"\bcode{delim}([A-Za-z0-9-]{{4,12}})\b", re.I),
         re.compile(rf"(?:{all_kw}){delim}([A-Za-z0-9-]{{4,12}})\b", re.I),
     ]
-
     for source in (plain, raw):
-        for pattern in keyword_patterns:
+        for pattern in patterns:
             match = pattern.search(source)
             if match and match.group(1) and not _looks_like_date(match.group(1).replace("-", "")):
                 return match.group(1)
-
     standalone = re.search(r"(?:^|\s)(\d{4,12})(?:\s|$|\.|,)", plain, re.M)
-    if standalone and standalone.group(1) and not _looks_like_date(standalone.group(1)):
+    if standalone and not _looks_like_date(standalone.group(1)):
         return standalone.group(1)
-
     return None
 
 
 class EmailService:
-    def __init__(self):
+    """Outlook Email Plus 邮箱池适配。"""
+
+    def __init__(self) -> None:
         load_dotenv()
         self.base_url = (
-            os.getenv("MAIL_BASE_URL")
-            or os.getenv("WORKER_DOMAIN")
+            os.getenv("OEP_BASE_URL")
+            or os.getenv("MAIL_BASE_URL")
             or ""
         ).rstrip("/")
         if self.base_url and not self.base_url.startswith("http"):
             self.base_url = f"https://{self.base_url}"
 
-        self.admin_password = (
-            os.getenv("MAIL_ADMIN_PASSWORD")
-            or os.getenv("ADMIN_PASSWORD")
-            or os.getenv("FREEMAIL_TOKEN")
-        )
-        self.domain = os.getenv("MAIL_DOMAIN", "").strip()
-        self.site_password = os.getenv("MAIL_SITE_PASSWORD", "").strip()
+        self.api_key = (
+            os.getenv("OEP_API_KEY")
+            or os.getenv("MAIL_API_KEY")
+            or os.getenv("MAIL_ADMIN_PASSWORD")
+            or ""
+        ).strip()
+        self.provider = (os.getenv("OEP_PROVIDER") or "outlook").strip()
+        self.project_key = (os.getenv("OEP_PROJECT_KEY") or "gptsignup").strip()
+        self.caller_id = (
+            os.getenv("OEP_CALLER_ID") or os.getenv("HOSTNAME") or "gptsignup"
+        ).strip()
 
         if not self.base_url:
-            raise ValueError("Missing: MAIL_BASE_URL (or WORKER_DOMAIN)")
-        if not self.admin_password:
-            raise ValueError("Missing: MAIL_ADMIN_PASSWORD (or ADMIN_PASSWORD)")
-        if not self.domain:
-            raise ValueError("Missing: MAIL_DOMAIN")
+            raise ValueError("Missing: OEP_BASE_URL (or MAIL_BASE_URL)")
+        if not self.api_key:
+            raise ValueError("Missing: OEP_API_KEY")
+        if self.provider == "cloudflare_temp_mail":
+            raise ValueError(
+                "OEP_PROVIDER=cloudflare_temp_mail 已弃用；请改用 outlook/imap 等长期邮箱池"
+            )
 
-        self.admin_headers = {
-            "x-admin-auth": self.admin_password,
+        self._headers = {
+            "X-API-Key": self.api_key,
             "Content-Type": "application/json",
-            "x-lang": "zh",
+            "Accept": "application/json",
         }
-        if self.site_password:
-            self.admin_headers["x-custom-auth"] = self.site_password
+        # email -> lease metadata
+        self._leases: dict[str, dict[str, Any]] = {}
 
-        # address -> {jwt, address_id}
-        self._mailboxes = {}
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}{path}"
 
-    def _auth_headers(self, jwt: str) -> dict:
-        headers = {
-            "Authorization": f"Bearer {jwt}",
-            "x-lang": "zh",
+    def create_email(self) -> tuple[str | None, str | None]:
+        """领取邮箱：POST /api/external/pool/claim-random。
+
+        返回 (claim_token, email)，保持旧调用方解构兼容。
+        """
+        task_id = f"gpt-{uuid.uuid4().hex[:16]}"
+        body: dict[str, Any] = {
+            "caller_id": self.caller_id,
+            "task_id": task_id,
+            "provider": self.provider,
         }
-        if self.site_password:
-            headers["x-custom-auth"] = self.site_password
-        return headers
-
-    @staticmethod
-    def _random_name(length: int = 12) -> str:
-        alphabet = string.ascii_lowercase + string.digits
-        return "".join(random.choices(alphabet, k=length))
-
-    def create_email(self):
-        """创建临时邮箱 POST /admin/new_address"""
+        if self.project_key:
+            body["project_key"] = self.project_key
         try:
             res = requests.post(
-                f"{self.base_url}/admin/new_address",
-                headers=self.admin_headers,
-                json={
-                    "name": self._random_name(),
-                    "domain": self.domain,
-                    "enablePrefix": False,
-                },
-                timeout=15,
+                self._url("/api/external/pool/claim-random"),
+                headers=self._headers,
+                json=body,
+                timeout=20,
             )
-            if res.status_code != 200:
-                print(f"[-] 创建邮箱失败: {res.status_code} - {res.text}")
+            payload = res.json() if res.content else {}
+            if not payload.get("success"):
+                print(
+                    f"[-] 领取邮箱失败: {payload.get('code')} - {payload.get('message')}"
+                )
                 return None, None
-
-            data = res.json()
-            email = data.get("address")
-            jwt = data.get("jwt")
-            address_id = data.get("address_id")
-            if not email or not jwt:
-                print(f"[-] 创建邮箱失败: 响应缺少 address/jwt - {data}")
+            data = payload.get("data") or {}
+            email = data.get("email")
+            claim_token = data.get("claim_token")
+            account_id = data.get("account_id")
+            if not email or not claim_token or account_id is None:
+                print(f"[-] 领取邮箱失败: 响应缺字段 - {data}")
                 return None, None
-
-            self._mailboxes[email] = {
-                "jwt": jwt,
-                "address_id": address_id,
+            self._leases[email] = {
+                "account_id": account_id,
+                "claim_token": claim_token,
+                "caller_id": self.caller_id,
+                "task_id": task_id,
             }
-            return jwt, email
-        except Exception as e:
-            print(f"[-] 创建邮箱失败: {e}")
+            return claim_token, email
+        except Exception as exc:
+            print(f"[-] 领取邮箱失败: {exc}")
             return None, None
 
-    def _extract_code_from_mail(self, mail: dict):
-        # subject 优先：xAI 把验证码放在主题最前面
-        for field in ("subject", "text", "html"):
-            code = extract_verification_code(mail.get(field) or "")
-            if code:
-                return code.replace("-", "")
-        # 组合字段再试一次，避免 code 跨字段
-        combined = "\n".join(
-            str(mail.get(f) or "") for f in ("subject", "text", "html")
-        )
-        code = extract_verification_code(combined)
-        return code.replace("-", "") if code else None
-
-    def fetch_verification_code(self, email, max_attempts=40):
-        """轮询收件箱获取验证码 GET /api/parsed_mails"""
-        box = self._mailboxes.get(email)
-        if not box or not box.get("jwt"):
-            print(f"[-] 无法获取验证码: 未找到邮箱 JWT ({email})")
+    def fetch_verification_code(self, email: str, max_attempts: int = 40) -> str | None:
+        """优先 OEP verification-code；失败再读 messages 本地抽码。"""
+        if email not in self._leases:
+            print(f"[-] 无法获取验证码: 未找到租约 ({email})")
             return None
 
-        headers = self._auth_headers(box["jwt"])
         interval = 2
-
+        params = {
+            "email": email,
+            "since_minutes": 15,
+            "folder": "inbox",
+        }
         for attempt in range(max_attempts):
             try:
                 res = requests.get(
-                    f"{self.base_url}/api/parsed_mails",
-                    params={"limit": 10, "offset": 0},
-                    headers=headers,
-                    timeout=15,
+                    self._url("/api/external/verification-code"),
+                    headers=self._headers,
+                    params=params,
+                    timeout=20,
                 )
-                if res.status_code == 429:
-                    time.sleep(min(interval * 2, 10))
-                    interval = min(interval * 2, 10)
-                    continue
-                if res.status_code == 200:
-                    payload = res.json()
-                    results = payload.get("results") or []
-                    for mail in results:
-                        code = self._extract_code_from_mail(mail)
-                        if code:
-                            return code
+                payload = res.json() if res.content else {}
+                if payload.get("success"):
+                    data = payload.get("data") or {}
+                    code = data.get("code") or data.get("verification_code")
+                    if code:
+                        return str(code).replace("-", "")
+                # fallback: list messages and extract locally
+                code = self._fetch_code_from_messages(email)
+                if code:
+                    return code
             except Exception:
                 pass
-
             time.sleep(interval)
-            # 轻微退避，避免打爆 API
             if attempt > 0 and attempt % 5 == 0:
                 interval = min(interval + 1, 5)
-
         return None
 
-    def delete_email(self, address):
-        """删除邮箱 DELETE /api/delete_address（优先用地址 JWT）"""
+    def _fetch_code_from_messages(self, email: str) -> str | None:
+        res = requests.get(
+            self._url("/api/external/messages"),
+            headers=self._headers,
+            params={"email": email, "top": 10, "since_minutes": 15},
+            timeout=20,
+        )
+        payload = res.json() if res.content else {}
+        if not payload.get("success"):
+            return None
+        data = payload.get("data") or {}
+        emails = data.get("emails") or data.get("messages") or []
+        for mail in emails:
+            for field in ("subject", "content", "html_content", "text", "html"):
+                code = extract_verification_code(str(mail.get(field) or ""))
+                if code:
+                    return code.replace("-", "")
+        return None
+
+    def complete_email(self, address: str, *, result: str = "success", detail: str = "") -> bool:
+        """任务成功/终态：POST /api/external/pool/claim-complete。"""
+        return self._finish(address, mode="complete", result=result, detail=detail)
+
+    def delete_email(self, address: str) -> bool:
+        """中途放弃：POST /api/external/pool/claim-release。"""
+        return self._finish(address, mode="release")
+
+    def _finish(
+        self,
+        address: str,
+        *,
+        mode: str,
+        result: str = "success",
+        detail: str = "",
+    ) -> bool:
         if not address:
             return False
-
-        box = self._mailboxes.pop(address, None)
+        lease = self._leases.pop(address, None)
+        if not lease:
+            return False
+        body = {
+            "account_id": lease["account_id"],
+            "claim_token": lease["claim_token"],
+            "caller_id": lease["caller_id"],
+            "task_id": lease["task_id"],
+        }
         try:
-            if box and box.get("jwt"):
-                res = requests.delete(
-                    f"{self.base_url}/api/delete_address",
-                    headers=self._auth_headers(box["jwt"]),
-                    timeout=15,
-                )
-                if res.status_code == 200 and res.json().get("success"):
-                    return True
-
-            # 回退：admin 按 id 删除
-            address_id = (box or {}).get("address_id")
-            if not address_id:
-                address_id = self._lookup_address_id(address)
-            if not address_id:
-                return False
-
-            res = requests.delete(
-                f"{self.base_url}/admin/delete_address/{address_id}",
-                headers=self.admin_headers,
-                timeout=15,
+            if mode == "complete":
+                body["result"] = result
+                if detail:
+                    body["detail"] = detail
+                path = "/api/external/pool/claim-complete"
+            else:
+                body["reason"] = detail or "registration_aborted"
+                path = "/api/external/pool/claim-release"
+            res = requests.post(
+                self._url(path),
+                headers=self._headers,
+                json=body,
+                timeout=20,
             )
-            return res.status_code == 200 and res.json().get("success")
+            payload = res.json() if res.content else {}
+            return bool(payload.get("success"))
         except Exception:
             return False
-
-    def _lookup_address_id(self, address: str):
-        try:
-            res = requests.get(
-                f"{self.base_url}/admin/address",
-                params={"limit": 20, "offset": 0, "query": address},
-                headers=self.admin_headers,
-                timeout=15,
-            )
-            if res.status_code != 200:
-                return None
-            results = (res.json() or {}).get("results") or []
-            for row in results:
-                if row.get("name") == address:
-                    return row.get("id")
-        except Exception:
-            return None
-        return None
