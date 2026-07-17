@@ -34,6 +34,7 @@ shared_impersonate = ""
 
 def register_worker() -> None:
     time.sleep(random.uniform(0, 3))
+    consecutive_fail = 0
     while not stop_event.is_set():
         flow = None
         try:
@@ -42,13 +43,24 @@ def register_worker() -> None:
                 impersonate=shared_impersonate,
             )
             result = flow.register_one()
+            consecutive_fail = 0
         except RegistrationError as exc:
-            print(f"[-] 注册失败: {str(exc)[:120]}")
-            time.sleep(2)
+            msg = str(exc)
+            print(f"[-] 注册失败: {msg[:160]}")
+            consecutive_fail += 1
+            low = msg.lower()
+            # 脏号已 retire：短退避即可换下一个；429 必须长退避避免烧 IP
+            if "429" in low or "too many requests" in low:
+                time.sleep(min(60, 10 * consecutive_fail))
+            elif "not signup-ready" in low or "login_password" in low:
+                time.sleep(1)
+            else:
+                time.sleep(min(15, 2 * consecutive_fail))
             continue
         except Exception as exc:
-            print(f"[-] 异常: {str(exc)[:120]}")
-            time.sleep(3)
+            print(f"[-] 异常: {str(exc)[:160]}")
+            consecutive_fail += 1
+            time.sleep(min(20, 3 * consecutive_fail))
             continue
         finally:
             if flow is not None:

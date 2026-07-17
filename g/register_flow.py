@@ -29,6 +29,23 @@ from .session_token import fetch_access_token
 
 __all__ = ["RegisterFlow", "RegisterResult", "RegistrationError"]
 
+# 仅这些 page 允许继续走注册步骤；login_* 再调 register 必 400。
+_SIGNUP_PAGE_TYPES = frozenset(
+    {
+        "create_account_password",
+        "email_otp_verification",
+    }
+)
+# 邮箱已被 OpenAI 记成登录流 / 半注册，应冻结出池，避免 claim 后再踩。
+_DIRTY_PAGE_TYPES = frozenset(
+    {
+        "login_password",
+        "login",
+        "login_email_verification",
+        "email_otp_verification_with_code",  # 兼容可能出现的登录 OTP 变体名
+    }
+)
+
 
 @dataclass(slots=True)
 class RegisterResult:
@@ -54,6 +71,23 @@ class RegisterFlow:
         except Exception:
             pass
 
+    def _retire_dirty_email(self, email: str, page_type: str) -> bool:
+        """脏号：claim-complete(provider_blocked) → 池状态 frozen。
+
+        Returns:
+            True 表示 complete 成功（勿再 release）；False 表示需走 release。
+        """
+        try:
+            return bool(
+                self.email_service.complete_email(
+                    email,
+                    result="provider_blocked",
+                    detail=f"not_signup_page:{page_type or 'empty'}",
+                )
+            )
+        except Exception:
+            return False
+
     def register_one(self) -> RegisterResult:
         email = None
         finished = False
@@ -72,6 +106,15 @@ class RegisterFlow:
 
             page_type = authorize_continue(self.session, self.device_id, email)
             print(f"[*] authorize/continue page={page_type or '?'}")
+
+            # Why: login_password 等页再调 register_password 必 400，且污染限流。
+            if page_type in _DIRTY_PAGE_TYPES or page_type not in _SIGNUP_PAGE_TYPES:
+                if self._retire_dirty_email(email, page_type):
+                    finished = True  # frozen 出池，勿 release 回 available
+                raise RegistrationError(
+                    f"email not signup-ready: page={page_type or 'empty'} "
+                    f"(retired from pool; use a fresh mailbox)"
+                )
 
             if page_type != "email_otp_verification":
                 register_password(self.session, self.device_id, email, password)
