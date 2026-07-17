@@ -40,11 +40,24 @@ def _normalize_mail_text(text: str) -> str:
 
 
 def extract_verification_code(text: str) -> str | None:
-    """本地兜底抽码；主路径优先走 OEP verification-code。"""
+    """本地兜底抽码；主路径优先走 OEP verification-code。
+
+    Why: OpenAI 正文是「temporary verification code to continue:\\n\\n303470」，
+    码在关键词后换行，不是 `code: 123456` 同行格式。
+    """
     if not text:
         return None
     raw = text.strip()
     plain = _normalize_mail_text(text)
+
+    # OpenAI / 同类：关键词后 0~80 字符窗口内的 4-8 位数字码
+    openai_like = re.search(
+        r"(?is)(?:temporary\s+)?verification\s+code(?:\s+to\s+continue)?(.{0,80}?)(\d{4,8})\b",
+        plain,
+    )
+    if openai_like and not _looks_like_date(openai_like.group(2)):
+        return openai_like.group(2)
+
     delim = r"\s*(?:[:：]|\bis\b|是|为|です)[\s:：]*"
     cn_ja_ko_kw = r"验证码|认证码|确认码|認証コード|인증\s*코드|코드"
     en_kw = r"verification\s*code|confirm(?:ation)?\s*code|security\s*code|passcode|OTP|pin\s*code"
@@ -196,7 +209,7 @@ class EmailService:
         res = requests.get(
             self._url("/api/external/messages"),
             headers=self._headers,
-            params={"email": email, "top": 10, "since_minutes": 15},
+            params={"email": email, "top": 10, "since_minutes": 30},
             timeout=20,
         )
         payload = res.json() if res.content else {}
@@ -204,12 +217,48 @@ class EmailService:
             return None
         data = payload.get("data") or {}
         emails = data.get("emails") or data.get("messages") or []
+        # OEP list 摘要字段是 content_preview；详情才有 content
+        fields = (
+            "subject",
+            "content_preview",
+            "content",
+            "html_content",
+            "text",
+            "html",
+        )
         for mail in emails:
-            for field in ("subject", "content", "html_content", "text", "html"):
+            for field in fields:
                 code = extract_verification_code(str(mail.get(field) or ""))
                 if code:
                     return code.replace("-", "")
+            # 摘要抽不出时拉详情
+            msg_id = mail.get("id")
+            if not msg_id:
+                continue
+            detail = self._fetch_message_detail(email, str(msg_id))
+            if not detail:
+                continue
+            for field in fields:
+                code = extract_verification_code(str(detail.get(field) or ""))
+                if code:
+                    return code.replace("-", "")
         return None
+
+    def _fetch_message_detail(self, email: str, message_id: str) -> dict[str, Any] | None:
+        try:
+            res = requests.get(
+                self._url(f"/api/external/messages/{message_id}"),
+                headers=self._headers,
+                params={"email": email},
+                timeout=20,
+            )
+            payload = res.json() if res.content else {}
+            if not payload.get("success"):
+                return None
+            data = payload.get("data")
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def complete_email(self, address: str, *, result: str = "success", detail: str = "") -> bool:
         """任务成功/终态：POST /api/external/pool/claim-complete。"""
