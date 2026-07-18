@@ -149,11 +149,54 @@ class BrowserSession:
         return self._context.new_page()
 
     def open(self, url: str, *, wait_cf: bool = True) -> str:
-        """打开 URL；可选等待 Cloudflare 挑战结束。返回最终 URL。"""
+        """打开 URL；可选等待 Cloudflare 挑战结束。返回最终 URL。
+
+        Why: VDS 机房出口常 403/卡 CF；goto 用更松的 wait + 重试，并给出可操作错误。
+        """
         self.start()
         page = self.page
         print(f"[*] browser open: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        last_err: Exception | None = None
+        # commit 最快；domcontentloaded 在 CF/慢网下易拖满 timeout
+        strategies = (
+            ("commit", min(self.timeout_ms, 45_000)),
+            ("domcontentloaded", self.timeout_ms),
+            ("load", self.timeout_ms),
+        )
+        for attempt in range(1, 4):
+            for wait_until, timeout in strategies:
+                try:
+                    page.goto(url, wait_until=wait_until, timeout=timeout)
+                    last_err = None
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    print(
+                        f"[!] goto fail attempt={attempt} wait_until={wait_until}: "
+                        f"{str(exc)[:120]}"
+                    )
+                    page.wait_for_timeout(800)
+            else:
+                # 本轮 strategies 全失败
+                if attempt < 3:
+                    page.wait_for_timeout(1500 * attempt)
+                continue
+            break
+        if last_err is not None:
+            proxy_hint = (
+                "已配置 PROXY"
+                if self.proxy
+                else "未配置 PROXY——VDS 机房 IP 访问 chatgpt.com 常 403/超时，请在 .env 设置 PROXY="
+            )
+            raise RuntimeError(
+                f"打开 {url} 失败（3 次重试）: {last_err}; {proxy_hint}"
+            ) from last_err
+
+        # 给 SPA/CF 一点时间出 title
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
         if wait_cf:
             self.wait_cf_clear()
         return str(page.url or "")
