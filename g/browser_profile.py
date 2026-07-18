@@ -1,7 +1,7 @@
 # Layer: L1 积木层
 # Contract: about-you 页：Full name + Age → Finish creating account。
 # Boundary: 仅 DOM；OTP/邮箱步骤在 browser_signup_steps。
-# Why: 实测表单是 name/age 两个可见输入 + 文案按钮，不是旧 birthday 下拉。
+# Why: VDS 上 about-you 常延迟渲染；须等待真实 name/age 输入再填。
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def is_logged_in_chatgpt(page: Any) -> bool:
         'nav[aria-label*="Chat history" i]',
     ):
         try:
-            if page.locator(sel).count() > 0:
+            if page.locator(sel).count() > 0 and page.locator(sel).first.is_visible():
                 return True
         except Exception:
             continue
@@ -35,15 +35,21 @@ def is_logged_in_chatgpt(page: Any) -> bool:
 
 def looks_like_profile_page(page: Any) -> bool:
     url = (page.url or "").lower()
-    if "about-you" in url or "about_you" in url:
+    if "about-you" in url or "about_you" in url or "about_you" in url.replace("-", "_"):
         return True
     body = body_snip(page).lower()
-    if "how old are you" in body or "full name" in body and "age" in body:
+    if "how old are you" in body:
+        return True
+    if "full name" in body and "age" in body:
+        return True
+    if "finish creating account" in body:
         return True
     try:
-        return page.locator('input[name="name"], input[name="age"]').count() >= 1
+        if page.locator('input[name="name"], input[name="age"], input[placeholder*="Full name" i]').count() >= 1:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 def submit_profile(page: Any, *, full_name: str = "", age: int = 0) -> None:
@@ -52,34 +58,39 @@ def submit_profile(page: Any, *, full_name: str = "", age: int = 0) -> None:
         return
 
     full_name = (full_name or random_full_name()).strip()
-    # Contract: Age 必须成年；默认 22–34，禁止 <18。
     age = int(age or random.randint(22, 34))
     if age < 18:
         age = 18
 
-    name_el = _name_input(page)
+    # Contract: 先等到 name 框真正可见，避免 about-you 路由到了但表单未挂载。
+    name_el = _wait_name_input(page, timeout_s=40)
     if name_el is None:
-        raise RuntimeError("about-you: Full name 输入框未找到")
-    name_el.click(timeout=5000)
-    name_el.fill("")
-    name_el.type(full_name, delay=30)
+        raise RuntimeError(
+            "about-you: Full name 输入框未找到 "
+            f"url={page.url} title={_safe_title(page)!r} body={body_snip(page)[:220]!r}"
+        )
+
+    _fill_text(name_el, full_name)
     print(f"[*] full_name={full_name}")
 
-    # Why: 实测需从 Full Name Tab 进 Age，直接点/fill age 有时不触发校验。
-    name_el.press("Tab")
-    page.wait_for_timeout(200)
+    # Why: 从 Full Name Tab 进 Age，兼容 React 受控输入。
+    try:
+        name_el.press("Tab")
+    except Exception:
+        pass
+    page.wait_for_timeout(300)
 
     age_el = _focused_or_age_input(page)
     if age_el is None:
-        raise RuntimeError("about-you: Age 输入框未找到")
-    try:
-        age_el.fill("")
-    except Exception:
-        pass
-    age_el.type(str(age), delay=40)
+        age_el = _wait_age_input(page, timeout_s=10)
+    if age_el is None:
+        raise RuntimeError(
+            "about-you: Age 输入框未找到 "
+            f"url={page.url} body={body_snip(page)[:180]!r}"
+        )
+    _fill_text(age_el, str(age))
     print(f"[*] age={age} (tab-from-name)")
 
-    # 失焦触发 React change
     try:
         age_el.press("Tab")
     except Exception:
@@ -90,8 +101,11 @@ def submit_profile(page: Any, *, full_name: str = "", age: int = 0) -> None:
         page,
         (
             'button:has-text("Finish creating account")',
+            'button:has-text("Finish creating")',
             'button:has-text("Finish")',
             'button:has-text("Create account")',
+            'button:has-text("创建账户")',
+            'button:has-text("完成")',
             'button[type="submit"]',
             'button:has-text("Continue")',
             'button:has-text("Done")',
@@ -99,7 +113,6 @@ def submit_profile(page: Any, *, full_name: str = "", age: int = 0) -> None:
         timeout_ms=8000,
     )
     if not clicked:
-        # 回车提交兜底
         try:
             age_el.press("Enter")
             clicked = True
@@ -116,63 +129,177 @@ def submit_profile(page: Any, *, full_name: str = "", age: int = 0) -> None:
             return
         if is_logged_in_chatgpt(page):
             return
+        # 可能还要再点一次 finish
+        click_first(
+            page,
+            (
+                'button:has-text("Finish creating account")',
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+            ),
+            timeout_ms=600,
+        )
         page.wait_for_timeout(700)
     print(f"[!] still on profile url={page.url}")
 
 
+def _wait_name_input(page: Any, *, timeout_s: float = 40) -> Any | None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        el = _name_input(page)
+        if el is not None:
+            return el
+        # SPA 渲染中
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+    return None
+
+
+def _wait_age_input(page: Any, *, timeout_s: float = 10) -> Any | None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        el = _age_input(page)
+        if el is not None:
+            return el
+        page.wait_for_timeout(300)
+    return None
+
+
 def _name_input(page: Any) -> Any | None:
-    for sel in (
+    selectors = (
         'input[name="name"]',
+        'input[id*="name" i]',
         'input[placeholder="Full name"]',
         'input[placeholder*="Full name" i]',
+        'input[placeholder*="Name" i]',
         'input[autocomplete="name"]',
+        'input[aria-label*="Full name" i]',
+        'input[aria-label*="Name" i]',
+        'input[type="text"]',
+    )
+    # Playwright label API
+    try:
+        by_label = page.get_by_label("Full name", exact=False)
+        if by_label.count() > 0 and by_label.first.is_visible():
+            return by_label.first
+    except Exception:
+        pass
+    try:
+        by_ph = page.get_by_placeholder("Full name", exact=False)
+        if by_ph.count() > 0 and by_ph.first.is_visible():
+            return by_ph.first
+    except Exception:
+        pass
+
+    for sel in selectors:
+        loc = page.locator(sel)
+        try:
+            n = loc.count()
+            for i in range(min(n, 6)):
+                el = loc.nth(i)
+                typ = (el.get_attribute("type") or "text").lower()
+                if typ in {"hidden", "file", "checkbox", "radio", "email", "password", "number"}:
+                    # number 留给 age；name 一般是 text
+                    if typ != "text" and "name" not in sel:
+                        continue
+                    if typ in {"hidden", "file", "checkbox", "radio", "email", "password"}:
+                        continue
+                if not el.is_visible():
+                    continue
+                # 跳过明显不是名字的框
+                name = (el.get_attribute("name") or "").lower()
+                ph = (el.get_attribute("placeholder") or "").lower()
+                aria = (el.get_attribute("aria-label") or "").lower()
+                if any(k in name or k in ph or k in aria for k in ("email", "phone", "code", "search")):
+                    continue
+                if "age" in name or ph == "age":
+                    continue
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def _age_input(page: Any) -> Any | None:
+    try:
+        by_label = page.get_by_label("Age", exact=False)
+        if by_label.count() > 0 and by_label.first.is_visible():
+            return by_label.first
+    except Exception:
+        pass
+    try:
+        by_ph = page.get_by_placeholder("Age", exact=False)
+        if by_ph.count() > 0 and by_ph.first.is_visible():
+            return by_ph.first
+    except Exception:
+        pass
+    for sel in (
+        'input[name="age"]',
+        'input[id*="age" i]',
+        'input[placeholder="Age"]',
+        'input[placeholder*="Age" i]',
+        'input[aria-label*="Age" i]',
+        'input[type="number"]',
     ):
         loc = page.locator(sel)
         try:
-            if loc.count() == 0:
-                continue
-            el = loc.first
-            typ = (el.get_attribute("type") or "").lower()
-            if typ == "hidden":
-                continue
-            el.wait_for(state="visible", timeout=5000)
-            return el
+            n = loc.count()
+            for i in range(min(n, 4)):
+                el = loc.nth(i)
+                typ = (el.get_attribute("type") or "").lower()
+                if typ == "hidden":
+                    continue
+                if el.is_visible():
+                    return el
         except Exception:
             continue
     return None
 
 
 def _focused_or_age_input(page: Any) -> Any | None:
-    # Tab 后优先当前焦点；否则回退 name=age
     try:
         focused = page.evaluate_handle("() => document.activeElement")
         tag = focused.evaluate("el => el && el.tagName")
         name = focused.evaluate("el => (el && el.name) || ''")
         typ = focused.evaluate("el => (el && el.type) || ''")
-        if tag == "INPUT" and (name == "age" or typ == "number"):
+        ph = focused.evaluate("el => (el && el.placeholder) || ''")
+        if tag == "INPUT" and (
+            name == "age" or typ == "number" or "age" in str(ph).lower()
+        ):
             return focused.as_element()
     except Exception:
         pass
-    for sel in (
-        'input[name="age"]',
-        'input[placeholder="Age"]',
-        'input[placeholder*="Age" i]',
-        'input[type="number"]',
-    ):
-        loc = page.locator(sel)
-        try:
-            if loc.count() == 0:
-                continue
-            el = loc.first
-            typ = (el.get_attribute("type") or "").lower()
-            if typ == "hidden":
-                continue
-            if el.is_visible():
-                el.click(timeout=2000)
-                return el
-        except Exception:
-            continue
-    return None
+    return _age_input(page)
+
+
+def _fill_text(el: Any, value: str) -> None:
+    el.click(timeout=5000)
+    try:
+        el.fill("")
+    except Exception:
+        pass
+    try:
+        el.fill(value)
+    except Exception:
+        el.type(value, delay=30)
+    # React 受控：再敲一次确保
+    try:
+        cur = el.input_value()
+        if value and value not in (cur or ""):
+            el.fill("")
+            el.type(value, delay=25)
+    except Exception:
+        pass
+
+
+def _safe_title(page: Any) -> str:
+    try:
+        return page.title() or ""
+    except Exception:
+        return ""
 
 
 def random_full_name() -> str:

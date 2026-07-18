@@ -241,16 +241,28 @@ def submit_otp(page: Any, code: str) -> None:
     print(f"[*] OTP submitted url={page.url}")
 
 
-def wait_profile_page(page: Any, timeout_s: float = 60) -> None:
-    """等到 Full Name / Age（或 birthday）资料页。"""
+def wait_profile_page(page: Any, timeout_s: float = 90) -> None:
+    """等到 Full Name / Age 资料页（最好等到输入框已挂载）。"""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if is_logged_in_chatgpt(page):
             print("[*] 已登录，跳过资料页")
             return
         if looks_like_profile_page(page):
-            print(f"[*] profile page ready url={page.url}")
-            return
+            # about-you 路由到了仍可能表单未渲染，再等一小会有 name 输入
+            try:
+                if page.locator(
+                    'input[name="name"], input[placeholder*="Full name" i], input[name="age"]'
+                ).count() > 0:
+                    print(f"[*] profile page ready url={page.url}")
+                    return
+            except Exception:
+                pass
+            # URL 已是 about-you：也算 ready，submit_profile 会再等输入框
+            url = (page.url or "").lower()
+            if "about-you" in url or "about_you" in url:
+                print(f"[*] profile route ready (waiting inputs later) url={page.url}")
+                return
         click_first(
             page,
             (
