@@ -70,25 +70,39 @@ def open_accounts_and_create_openai(page: Any, account_name: str) -> None:
 
 def open_create_openai_account(page: Any, account_name: str) -> None:
     """点添加账号 → 填名称 → OpenAI → 下一步。"""
+    from .browser_wait import wait_visible
+
     _dismiss_popups_with_esc(page)
-    if not _click_any(
+    add_btn = wait_visible(
         page,
         (
             'button:has-text("添加账号")',
             'button:has-text("Create Account")',
             'button:has-text("Add Account")',
             'button:has-text("新建账号")',
-            'button.btn-primary:has-text("账号")',
         ),
-    ):
+        timeout_s=25,
+        require_enabled=True,
+    )
+    if add_btn is None:
         raise AdminImportError("找不到「添加账号」按钮")
-    page.wait_for_timeout(1000)
+    add_btn.click(timeout=8000)
+    page.wait_for_timeout(800)
 
-    name_input = page.locator(
-        '[data-tour="account-form-name"], input[placeholder*="账户"], '
-        'input[placeholder*="Account"], input[placeholder*="名称"]'
-    ).first
-    name_input.wait_for(state="visible", timeout=20000)
+    name_input = wait_visible(
+        page,
+        (
+            '[data-tour="account-form-name"]',
+            'input[placeholder*="账户"]',
+            'input[placeholder*="Account"]',
+            'input[placeholder*="名称"]',
+            'input[placeholder*="name" i]',
+        ),
+        timeout_s=25,
+    )
+    if name_input is None:
+        raise AdminImportError("添加账号弹窗：账户名称输入框未出现")
+    name_input.click(timeout=3000)
     name_input.fill("")
     name_input.fill(account_name)
     print(f"[*] account name={account_name}")
@@ -113,22 +127,40 @@ def open_create_openai_account(page: Any, account_name: str) -> None:
             oauth_btn.first.click()
     page.wait_for_timeout(300)
 
-    if not _click_any(
+    next_btn = wait_visible(
         page,
         (
             '[data-tour="account-form-submit"]',
             'button:has-text("下一步")',
             'button:has-text("Next")',
-            'button.btn-primary:has-text("Next")',
         ),
-    ):
-        raise AdminImportError("点「下一步」失败")
-    page.wait_for_timeout(1000)
+        timeout_s=15,
+        require_enabled=True,
+    )
+    if next_btn is None:
+        raise AdminImportError("点「下一步」失败：按钮未出现")
+    next_btn.click(timeout=8000)
+    page.wait_for_timeout(1200)
     print("[*] create account step2 (oauth)")
 
 
 def select_manual_and_generate_auth_url(page: Any) -> str:
     """手动授权 + 生成授权链接，返回 auth URL。"""
+    from .browser_wait import wait_visible
+
+    # 等 step2 OAuth 区域渲染
+    wait_visible(
+        page,
+        (
+            'input[type="radio"][value="manual"]',
+            'label:has-text("手动授权")',
+            'label:has-text("Manual Authorization")',
+            'button:has-text("生成授权链接")',
+            'button:has-text("Generate Auth URL")',
+        ),
+        timeout_s=25,
+    )
+
     manual = page.locator('input[type="radio"][value="manual"]')
     if manual.count() > 0:
         try:
@@ -144,7 +176,7 @@ def select_manual_and_generate_auth_url(page: Any) -> str:
                 'span:has-text("手动授权")',
             ),
         )
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(500)
 
     auth_url = ""
 
@@ -169,7 +201,7 @@ def select_manual_and_generate_auth_url(page: Any) -> str:
 
     page.on("response", _on_response)
 
-    if not _click_any(
+    gen_btn = wait_visible(
         page,
         (
             'button:has-text("生成授权链接")',
@@ -177,10 +209,14 @@ def select_manual_and_generate_auth_url(page: Any) -> str:
             'button:has-text("Generate Auth URL")',
             'button:has-text("Generate")',
         ),
-    ):
+        timeout_s=20,
+        require_enabled=True,
+    )
+    if gen_btn is None:
         raise AdminImportError("找不到「生成授权链接」")
+    gen_btn.click(timeout=8000)
 
-    deadline = time.time() + 30
+    deadline = time.time() + 35
     while time.time() < deadline and not auth_url:
         try:
             for inp in page.locator("input[readonly], input.font-mono").all():
@@ -200,17 +236,21 @@ def select_manual_and_generate_auth_url(page: Any) -> str:
 
 def paste_callback_and_complete(page: Any, callback_or_code: str) -> None:
     """把回调 URL/code 填回授权码框并点完成授权。"""
+    from .browser_wait import wait_visible
+
     text = (callback_or_code or "").strip()
     if not text:
         raise AdminImportError("empty callback/code")
 
-    ta = page.locator("textarea").first
-    ta.wait_for(state="visible", timeout=15000)
+    ta = wait_visible(page, ("textarea",), timeout_s=25)
+    if ta is None:
+        raise AdminImportError("授权码 textarea 未出现")
+    ta.click(timeout=3000)
     ta.fill("")
     ta.fill(text)
     page.wait_for_timeout(400)
 
-    if not _click_any(
+    done = wait_visible(
         page,
         (
             'button:has-text("完成授权")',
@@ -219,8 +259,12 @@ def paste_callback_and_complete(page: Any, callback_or_code: str) -> None:
             'button:has-text("验证")',
             'button.btn-primary:has-text("授权")',
         ),
-    ):
-        raise AdminImportError("点「完成授权」失败")
+        timeout_s=15,
+        require_enabled=True,
+    )
+    if done is None:
+        raise AdminImportError("点「完成授权」失败：按钮未出现")
+    done.click(timeout=8000)
     page.wait_for_timeout(2500)
     print("[*] complete auth clicked")
 

@@ -210,9 +210,27 @@ def wait_otp_page(page: Any, timeout_s: float = 60) -> None:
 
 def submit_otp(page: Any, code: str) -> None:
     """填入邮箱验证码并 Continue。"""
+    from .browser_wait import wait_visible
+
     code = re.sub(r"\D", "", str(code or ""))
     if len(code) < 4:
         raise BrowserSignupError(f"invalid otp: {code!r}")
+
+    el0 = wait_visible(
+        page,
+        (
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i]',
+            'input[aria-label*="code" i]',
+            'input[placeholder*="code" i]',
+            'input[maxlength="1"]',
+        ),
+        timeout_s=30,
+    )
+    if el0 is None:
+        raise BrowserSignupError(
+            f"找不到验证码输入框 url={page.url} body={body_snip(page)[:160]!r}"
+        )
 
     loc = _otp_input(page)
     if loc.count() == 0:
@@ -222,6 +240,7 @@ def submit_otp(page: Any, code: str) -> None:
         for i, ch in enumerate(code[: loc.count()]):
             try:
                 box = loc.nth(i)
+                box.wait_for(state="visible", timeout=5000)
                 box.click(timeout=2000)
                 box.fill(ch)
             except Exception:

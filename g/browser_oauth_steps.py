@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 
@@ -38,11 +39,25 @@ def click_choose_account(page: Any, *, preferred_email: str = "") -> bool:
     Contract:
     - 若 preferred_email 非空，优先点包含该邮箱的项
     - 否则点第一个可见账号项（通常只有刚注册的那一个）
+    - 先等到含 @ 的可选项出现（最多 25s）
     Returns:
         True 表示点到了账号项。
     """
     preferred = (preferred_email or "").strip().lower()
     print(f"[*] choose account page url={page.url}")
+
+    # 等账号列表渲染（路由到了但列表可能延迟）
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        try:
+            # 有邮箱文本或 option 即可
+            if preferred and page.locator(f"text={preferred_email}").count() > 0:
+                break
+            if page.locator('button:has-text("@"), [role="option"], div[role="button"]:has-text("@")').count() > 0:
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(350)
 
     # 1) 优先按邮箱文本点
     if preferred:

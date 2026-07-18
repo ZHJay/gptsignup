@@ -123,6 +123,7 @@ class RegisterFlow:
             if not code:
                 raise RegistrationError("otp timeout")
             print(f"[*] OTP ok code_len={len(code)}")
+            # 再确认 OTP 输入框仍在（SPA 可能刚切页）
             submit_otp(chatgpt_page, code)
 
             wait_profile_page(chatgpt_page)

@@ -28,57 +28,71 @@ def page_needs_phone(page: Any) -> bool:
 
 
 def page_has_otp(page: Any) -> bool:
-    if _otp_input(page).count() > 0:
-        return True
-    body = _body(page).lower()
-    return "verification code" in body or "enter the code" in body or "验证码" in body
+    """必须有可见 OTP 输入，避免仅 body 文案误判。"""
+    loc = _otp_input(page)
+    try:
+        n = loc.count()
+        for i in range(min(n, 8)):
+            el = loc.nth(i)
+            if el.is_visible():
+                return True
+    except Exception:
+        pass
+    # URL 强信号
+    url = (page.url or "").lower()
+    if "email-verification" in url or "phone-otp" in url or "code" in url and "auth.openai.com" in url:
+        # 仍要求最终有输入框；这里只作弱提示
+        pass
+    return False
 
 
 def submit_phone_national(page: Any, national_number: str) -> None:
     """输入不带国家码的电话号并 Continue。"""
+    from .browser_wait import wait_visible
+
     digits = re.sub(r"\D", "", national_number or "")
     if len(digits) < 7:
         raise BrowserPhoneError(f"invalid national number: {national_number!r}")
 
-    # 优先 tel / phone 输入；避开已只读的国家码框
-    filled = False
-    for sel in (
-        'input[type="tel"]',
-        'input[name*="phone" i]',
-        'input[autocomplete="tel-national"]',
-        'input[autocomplete="tel"]',
-        'input[placeholder*="phone" i]',
-        'input[inputmode="tel"]',
-        'input[inputmode="numeric"]',
-    ):
-        loc = page.locator(sel)
-        try:
-            n = loc.count()
-            if n == 0:
-                continue
-            for i in range(n):
-                el = loc.nth(i)
-                if not el.is_visible():
-                    continue
-                # 跳过极短国家码框
-                try:
-                    ml = el.get_attribute("maxlength")
-                    if ml and ml.isdigit() and int(ml) <= 4:
-                        continue
-                except Exception:
-                    pass
-                el.click(timeout=3000)
-                el.fill("")
-                el.type(digits, delay=40)
-                filled = True
-                break
-        except Exception:
-            continue
-        if filled:
-            break
-    if not filled:
-        raise BrowserPhoneError(f"phone input not found url={page.url}")
+    # 等电话输入真正出现
+    phone_el = wait_visible(
+        page,
+        (
+            'input[type="tel"]',
+            'input[name*="phone" i]',
+            'input[autocomplete="tel-national"]',
+            'input[autocomplete="tel"]',
+            'input[placeholder*="phone" i]',
+            'input[inputmode="tel"]',
+        ),
+        timeout_s=30,
+    )
+    if phone_el is None:
+        raise BrowserPhoneError(
+            f"phone input not found url={page.url} body={_body(page)[:160]!r}"
+        )
 
+    # 跳过极短国家码框：若命中则找下一个
+    try:
+        ml = phone_el.get_attribute("maxlength")
+        if ml and ml.isdigit() and int(ml) <= 4:
+            phone_el = wait_visible(
+                page,
+                (
+                    'input[type="tel"]',
+                    'input[autocomplete="tel-national"]',
+                    'input[placeholder*="phone" i]',
+                ),
+                timeout_s=5,
+            )
+    except Exception:
+        pass
+    if phone_el is None:
+        raise BrowserPhoneError(f"phone input not found after skip country box url={page.url}")
+
+    phone_el.click(timeout=3000)
+    phone_el.fill("")
+    phone_el.type(digits, delay=40)
     print(f"[*] phone national filled len={len(digits)}")
     if not _click_continue(page):
         try:
@@ -90,10 +104,30 @@ def submit_phone_national(page: Any, national_number: str) -> None:
 
 def submit_sms_code(page: Any, code: str) -> None:
     """仅提交调用方传入的验证码；禁止空码/短码。"""
+    from .browser_wait import wait_visible
+
     code = re.sub(r"\D", "", str(code or ""))
     if len(code) < 4:
         raise BrowserPhoneError(
             f"refuse to submit invalid/empty sms code: {code!r}"
+        )
+
+    # 等 OTP 输入可见
+    el0 = wait_visible(
+        page,
+        (
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i]',
+            'input[aria-label*="code" i]',
+            'input[placeholder*="code" i]',
+            'input[maxlength="1"]',
+            'input[inputmode="numeric"]',
+        ),
+        timeout_s=30,
+    )
+    if el0 is None:
+        raise BrowserPhoneError(
+            f"sms code input not found url={page.url} body={_body(page)[:160]!r}"
         )
 
     loc = _otp_input(page)
@@ -108,6 +142,7 @@ def submit_sms_code(page: Any, code: str) -> None:
         for i, ch in enumerate(code[: loc.count()]):
             try:
                 box = loc.nth(i)
+                box.wait_for(state="visible", timeout=5000)
                 box.click(timeout=2000)
                 box.fill(ch)
             except Exception:
