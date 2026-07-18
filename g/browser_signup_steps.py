@@ -1,7 +1,7 @@
 # Layer: L1 积木层
-# Contract: ChatGPT 网页注册 DOM：Login → 邮箱 → OTP；资料页交给 browser_profile。
+# Contract: ChatGPT 网页注册 DOM：Login/Sign up → 邮箱 → OTP；资料页交给 browser_profile。
 # Boundary: 只操作 Playwright page；邮箱领取/收码由 EmailService 负责。
-# Why: 用户确认链路为 chatgpt.com 点 Login 后的无密码 OTP 注册流。
+# Why: VDS 上首页无邮箱框，须点 Log in / Sign up 弹出 modal 的 #email。
 
 from __future__ import annotations
 
@@ -38,70 +38,144 @@ class BrowserSignupError(RuntimeError):
 
 
 def click_login(page: Any) -> None:
-    """在 chatgpt.com 首页点 Log in。"""
+    """打开登录/注册入口（优先 Sign up / Log in 弹出邮箱 modal）。"""
     dismiss_cookie_banners(page)
-    # 已在可见邮箱框则跳过
-    if _visible_email_input(page):
+    if _real_email_input(page) is not None:
         print("[*] 已在邮箱输入页，跳过 Login 按钮")
         return
+
+    # Why: 注册优先 Sign up；没有再 Log in。首页误匹配会卡住。
     selectors = (
+        'button:has-text("Sign up for free")',
+        'button:has-text("Sign up")',
+        'a:has-text("Sign up for free")',
+        'a:has-text("Sign up")',
+        'button:has-text("注册")',
+        'a:has-text("注册")',
         'button:has-text("Log in")',
         'a:has-text("Log in")',
         'button:has-text("Log In")',
-        'a:has-text("Log In")',
         'button:has-text("登录")',
         'a:has-text("登录")',
         '[data-testid="login-button"]',
-        'button:has-text("Sign up")',
-        'a:has-text("Sign up")',
         'button:has-text("Get started")',
         'a:has-text("Get started")',
     )
-    if not click_first(page, selectors, timeout_ms=12_000):
-        if _visible_email_input(page):
+    if not click_first(page, selectors, timeout_ms=15_000):
+        if _real_email_input(page) is not None:
             print("[*] 已在邮箱输入页，跳过 Login 按钮")
             return
-        raise BrowserSignupError("找不到 Log in 按钮")
-    page.wait_for_timeout(800)
-    print(f"[*] clicked login url={page.url}")
+        # 兜底：直开 auth 邮箱页
+        print("[!] 首页无 Login 按钮，goto auth.openai.com create-account")
+        try:
+            page.goto(
+                "https://auth.openai.com/create-account",
+                wait_until="domcontentloaded",
+                timeout=120_000,
+            )
+            page.wait_for_timeout(1500)
+        except Exception as exc:
+            raise BrowserSignupError(f"找不到 Log in 且直开 auth 失败: {exc}") from exc
+        return
 
+    page.wait_for_timeout(1200)
+    print(f"[*] clicked login/signup url={page.url}")
 
-def _visible_email_input(page: Any) -> bool:
-    loc = _email_input(page)
-    try:
-        if loc.count() == 0:
-            return False
-        return bool(loc.first.is_visible())
-    except Exception:
-        return False
+    # 等 modal / 跳转出现真实邮箱框
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if _real_email_input(page) is not None:
+            print("[*] email modal/input ready")
+            return
+        if "auth.openai.com" in (page.url or ""):
+            print(f"[*] navigated to auth url={page.url}")
+            return
+        page.wait_for_timeout(400)
 
 
 def submit_email(page: Any, email: str) -> None:
     """输入邮箱并 Continue。"""
-    deadline = time.time() + 45
+    # 若还没邮箱框，再尝试一次点 Login/Sign up
+    if _real_email_input(page) is None:
+        try:
+            click_login(page)
+        except BrowserSignupError:
+            pass
+
+    deadline = time.time() + 50
+    el = None
     while time.time() < deadline:
-        loc = _email_input(page)
-        if loc.count() > 0:
+        el = _real_email_input(page)
+        if el is not None:
             try:
-                el = loc.first
                 el.wait_for(state="visible", timeout=5000)
                 el.click(timeout=3000)
                 el.fill("")
                 el.fill(email)
+                # 校验写进去了
+                val = ""
+                try:
+                    val = el.input_value()
+                except Exception:
+                    val = email
+                if email.split("@")[0][:4] in (val or ""):
+                    break
+                el.type(email, delay=20)
                 break
             except Exception:
                 page.wait_for_timeout(500)
                 continue
+        # modal 可能被挡：再点一次 Log in
+        if int(time.time()) % 8 == 0:
+            click_first(
+                page,
+                (
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign up for free")',
+                    'button:has-text("Sign up")',
+                ),
+                timeout_ms=1500,
+            )
         page.wait_for_timeout(400)
     else:
-        raise BrowserSignupError(f"邮箱输入框未出现 url={page.url}")
+        # 最后兜底直开 auth
+        try:
+            page.goto(
+                "https://auth.openai.com/create-account",
+                wait_until="domcontentloaded",
+                timeout=120_000,
+            )
+            page.wait_for_timeout(1500)
+            el = _real_email_input(page)
+            if el is not None:
+                el.fill(email)
+            else:
+                raise BrowserSignupError(
+                    f"邮箱输入框未出现 url={page.url} body={body_snip(page)[:180]!r}"
+                )
+        except BrowserSignupError:
+            raise
+        except Exception as exc:
+            raise BrowserSignupError(
+                f"邮箱输入框未出现 url={page.url}: {exc}"
+            ) from exc
 
     if not click_continue(page):
-        try:
-            _email_input(page).first.press("Enter")
-        except Exception as exc:
-            raise BrowserSignupError(f"提交邮箱失败: {exc}") from exc
-    page.wait_for_timeout(1000)
+        # modal 里 Continue
+        if not click_first(
+            page,
+            (
+                'button:has-text("Continue")',
+                'button[type="submit"]:has-text("Continue")',
+                'button:has-text("继续")',
+            ),
+            timeout_ms=5000,
+        ):
+            try:
+                _real_email_input(page).press("Enter")  # type: ignore[union-attr]
+            except Exception as exc:
+                raise BrowserSignupError(f"提交邮箱失败: {exc}") from exc
+    page.wait_for_timeout(1200)
     print(f"[*] email submitted url={page.url}")
 
 
@@ -120,6 +194,14 @@ def wait_otp_page(page: Any, timeout_s: float = 60) -> None:
                 f"email not signup-ready: page=login_password url={page.url}"
             )
         if _otp_input(page).count() > 0:
+            # 排除首页假阳性
+            try:
+                if _otp_input(page).first.is_visible():
+                    print(f"[*] OTP page ready url={page.url}")
+                    return
+            except Exception:
+                pass
+        if "email-verification" in url or "email_otp" in url:
             print(f"[*] OTP page ready url={page.url}")
             return
         page.wait_for_timeout(500)
@@ -207,18 +289,45 @@ def wait_registered(page: Any, timeout_s: float = 90) -> None:
     print(f"[!] 未确认主站 UI，继续取 session url={page.url}")
 
 
-def _email_input(page: Any) -> Any:
-    return page.locator(
-        'input[type="email"], input[name*="email" i], input[autocomplete="username"], '
-        'input[autocomplete="email"], input[placeholder*="email" i]'
+def _real_email_input(page: Any) -> Any | None:
+    """返回可见、可编辑的邮箱框；排除 file/hidden。"""
+    selectors = (
+        'input#email',
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[autocomplete="email"]',
+        'input[autocomplete="username"]',
+        'input[placeholder="Email address"]',
+        'input[placeholder*="Email" i]',
+        'input[aria-label*="Email" i]',
     )
+    for sel in selectors:
+        loc = page.locator(sel)
+        try:
+            n = loc.count()
+            for i in range(min(n, 5)):
+                el = loc.nth(i)
+                typ = (el.get_attribute("type") or "").lower()
+                if typ in {"hidden", "file", "checkbox", "radio", "submit", "button"}:
+                    continue
+                if not el.is_visible():
+                    continue
+                # 可编辑
+                try:
+                    if el.is_disabled():
+                        continue
+                except Exception:
+                    pass
+                return el
+        except Exception:
+            continue
+    return None
 
 
 def _otp_input(page: Any) -> Any:
     return page.locator(
         'input[autocomplete="one-time-code"], input[name*="code" i], '
-        'input[inputmode="numeric"], input[aria-label*="code" i], '
-        'input[placeholder*="code" i], input[maxlength="1"]'
+        'input[aria-label*="code" i], input[placeholder*="code" i], input[maxlength="1"]'
     )
 
 
