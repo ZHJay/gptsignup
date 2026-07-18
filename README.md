@@ -1,117 +1,57 @@
-# ChatGPT 批量注册工具
+# ChatGPT 注册 + Sub2API 导入
 
-基于 `grokzhuce` 架构：自动注册 ChatGPT / OpenAI 账号，并在**同一 HTTP session** 内打开：
+流程：
 
 ```text
-https://chatgpt.com/api/auth/session
+chatgpt.com → Login → 邮箱 OTP → Full Name/Age
+  → 保持浏览器登录态
+  → https://api4kimi8.org/admin/accounts 添加账号
+  → 平台 OpenAI → 手动授权 → 生成授权链接
+  → 同浏览器打开链接 → Tiger SMS 手机验证
+  → 回填授权码完成导入
 ```
 
-提取 `accessToken`（相对 Grok 的 `sso`）。
+**accessToken 可选**，成功以 Sub2API 导入为准。
 
-## 邮箱后端
-
-**Outlook Email Plus** 邮箱池（`/api/external/*`），不再使用 Cloudflare Temp Mail。
-
-| 步骤 | 接口 |
-|------|------|
-| 领取邮箱 | `POST /api/external/pool/claim-random` |
-| 取验证码 | `GET /api/external/verification-code` |
-| 成功回写 | `POST /api/external/pool/claim-complete` |
-| 失败释放 | `POST /api/external/pool/claim-release` |
-
-前置条件：在 Outlook Email Plus 后台导入可用的 **Outlook/IMAP 账号** 到邮箱池（`provider=outlook` 或 `imap`），并开启对外 API + 邮箱池。
-
-## 快速开始（本地）
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # 填 OEP_BASE_URL / OEP_API_KEY
-python chatgpt.py                  # 交互
-python chatgpt.py --yes -w 3 -n 5  # 非交互
-```
-
-## Docker（小站推荐）
-
-```bash
-cp .env.example .env && chmod 600 .env
-# OEP_BASE_URL=http://outlook-email-plus:5000
-# OEP_API_KEY=...
-mkdir -p keys && chmod 700 keys
-
-docker compose build
-docker compose --profile tools run --rm gptsignup --yes -w 3 -n 1
-```
-
-环境变量：
+## 环境变量
 
 | 变量 | 说明 |
 |------|------|
-| `OEP_BASE_URL` | Outlook Email Plus 根地址；同机 Docker 用 `http://outlook-email-plus:5000` |
-| `OEP_API_KEY` | 对外 API Key（`X-API-Key`） |
-| `OEP_PROVIDER` | 池筛选，默认 `outlook`；勿用 `cloudflare_temp_mail` |
-| `OEP_PROJECT_KEY` | 项目隔离 key，默认 `gptsignup` |
-| `OEP_CALLER_ID` | 调用方标识 |
-| `PROXY` | 访问 OpenAI 的代理 |
-| `GPT_WORKERS` / `GPT_TOTAL` | 默认并发 / 数量 |
+| `OEP_*` | Outlook Email Plus 邮箱池 |
+| `SUB2API_BASE_URL` | 默认 `https://api4kimi8.org` |
+| `SUB2API_ADMIN_EMAIL` / `SUB2API_ADMIN_PASSWORD` | 管理端登录 |
+| `TIGER_SMS_API_KEY` | Tiger SMS v2 |
+| `TIGER_SMS_SERVICE` | 默认 `dr` |
+| `TIGER_SMS_COUNTRY` | 默认 `1001` |
+| `PROXY` | Playwright 代理 |
+| `BROWSER_HEADLESS` | 默认 `0`（有头） |
 
-输出挂载：`./keys` → 容器 `/app/keys`。
-
-## 小站部署与 push 自动更新
-
-路径约定：`ubuntu@小站:~/gptsignup`
-
-### 1. 服务器 bootstrap（一次性）
+## 本机运行
 
 ```bash
-cd ~
-mv gptsignup gptsignup.bak 2>/dev/null || true
-git clone https://github.com/ZHJay/gptsignup.git gptsignup
-cp gptsignup.bak/.env gptsignup/.env
-chmod 600 gptsignup/.env
-mkdir -p gptsignup/keys && chmod 700 gptsignup/keys
-cd gptsignup
-bash deploy/deploy.sh
+cd ~/Desktop/gptsignup
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chrome
+
+# .env 至少填：OEP_*、SUB2API_ADMIN_*、TIGER_SMS_API_KEY
+export BROWSER_HEADLESS=0
+export BROWSER_CHANNEL=chrome
+export PROXY=http://127.0.0.1:6152   # 按需
+
+python chatgpt.py --yes -w 1 -n 1
 ```
 
-### 2. GitHub Secrets
-
-| Secret | 示例 |
-|--------|------|
-| `SMALL_HOST` | `141.148.169.247` |
-| `SMALL_USER` | `ubuntu` |
-| `SMALL_SSH_KEY` | 小站私钥全文 |
-| `SMALL_DEPLOY_PATH` | `/home/ubuntu/gptsignup`（可选） |
-| `SMALL_PORT` | `22`（可选） |
-
-### 3. 自动更新
+## 输出
 
 ```text
-git push origin main
-  → GitHub Actions deploy-small
-  → SSH 小站
-  → deploy/deploy.sh
+keys/gpt_*_accounts.txt   # email|passwordless|token或no-token
+keys/gpt_*.txt            # 仅当取到 accessToken 时写入
 ```
 
-执行：
+## 注意
 
-```bash
-cd ~/gptsignup
-docker compose --profile tools run --rm gptsignup --yes -w 3 -n 1
-```
-
-## 与 Grok 差异
-
-| 项 | Grok | 本项目 |
-|---|---|---|
-| 凭据 | `sso` | `accessToken`（`/api/auth/session`） |
-| 输出 | `keys/grok_*` | `keys/gpt_*` + `*_accounts.txt` |
-| 邮箱 | CF Temp Mail | Outlook Email Plus 邮箱池 |
-
-## 注意事项
-
-1. `.env` 永不提交；服务器上单独维护。
-2. 池空会报 `NO_AVAILABLE_ACCOUNT`：先在 OEP 导入账号。
-3. `registration_disallowed` 多为邮箱域名/IP 风控，换池内账号或代理。
-4. Codex 路径可能强制 `add_phone`；默认 platform client 走 `about_you`。
-5. 仅供学习研究。
+1. 并发保持 **1**（浏览器 + 管理端 + 短信）。
+2. OAuth 与 ChatGPT 必须同一浏览器 context（代码已 `new_page` 共享 cookie）。
+3. 手机号填 **不带国家码** 的 national number（Tiger `national_number`）。
+4. 仅供学习研究。

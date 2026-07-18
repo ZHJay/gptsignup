@@ -1,5 +1,5 @@
 # Layer: L1 积木层
-# Contract: 在同一 curl_cffi Session 上 GET /api/auth/session，取出 accessToken。
+# Contract: 从 /api/auth/session 取出 accessToken（浏览器页内 fetch 为主，HTTP 兜底）。
 # Why: 相对 Grok 的 sso cookie，ChatGPT 凭据取自 session JSON 的 accessToken。
 # Boundary: 不负责登录/注册，只读已有会话态。
 
@@ -11,8 +11,23 @@ from typing import Any
 from .openai_headers import SESSION_URL, chat_session_headers
 
 
+def fetch_access_token_from_browser(browser: Any) -> str:
+    """在已登录的 BrowserSession 内 GET session，提取 accessToken。"""
+    try:
+        status, data, text = browser.page_fetch_json(url=SESSION_URL, method="GET")
+    except Exception as exc:
+        print(f"[-] browser session 请求异常: {exc}")
+        return ""
+    print(f"[*] /api/auth/session status={status}")
+    if isinstance(data, dict):
+        token = str(data.get("accessToken") or data.get("access_token") or "").strip()
+        if token:
+            return token
+    return _extract_token_from_text(text or "")
+
+
 def fetch_access_token(session, *, access_hint: str = "", timeout: int = 20) -> str:
-    """从 https://chatgpt.com/api/auth/session 提取 accessToken。
+    """从 https://chatgpt.com/api/auth/session 提取 accessToken（curl session 兜底）。
 
     Returns:
         非空 accessToken 字符串；失败返回 ""。

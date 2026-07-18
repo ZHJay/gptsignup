@@ -13,10 +13,13 @@ services:
     env_file:
       - .env
     environment:
-      # 可被 compose run -e 覆盖
-      GPT_WORKERS: ${GPT_WORKERS:-3}
+      # 可被 compose run -e 覆盖；浏览器默认并发 1
+      GPT_WORKERS: ${GPT_WORKERS:-1}
       GPT_TOTAL: ${GPT_TOTAL:-1}
       PROXY: ${PROXY:-}
+      BROWSER_HEADLESS: ${BROWSER_HEADLESS:-0}
+      BROWSER_CHANNEL: ${BROWSER_CHANNEL:-chrome}
+    shm_size: "1gb"
     networks:
       - default
       - oep

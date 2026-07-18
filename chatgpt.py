@@ -1,125 +1,68 @@
 #!/usr/bin/env python3
 # Layer: L2 流程层（CLI 边界）
-# Contract: 并发注册 ChatGPT；输出 keys 下 accessToken 列表与账号表。
-# Boundary: 仅编排 RegisterFlow + 文件写入；不实现协议细节。
-# Why: Docker/CI 无 TTY，必须支持 --workers/--total 与环境变量非交互运行。
+# Contract: 注册 ChatGPT 并导入 Sub2API；浏览器永不自动关闭。
+# Boundary: 仅编排 RegisterFlow + 文件写入。
+# Why: 成功后需保留 ChatGPT 登录 tab；进程保活直到用户 Ctrl+C。
+# Risk: 浏览器常驻，workers 必须 1。
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import os
-import random
-import threading
+import signal
 import time
 from datetime import datetime
 
 from dotenv import load_dotenv
 
 from g.account_record import format_account_record
-from g.http_session import pick_impersonate
 from g.register_flow import RegisterFlow, RegistrationError
 
 load_dotenv()
 
-file_lock = threading.Lock()
-success_count = 0
-start_time = time.time()
-target_count = 1
-stop_event = threading.Event()
-output_file = ""
-accounts_file = ""
-shared_impersonate = ""
+# 持有 flow，防止 GC；且永不在正常路径 close
+_live_flows: list[RegisterFlow] = []
 
 
-def register_worker() -> None:
-    time.sleep(random.uniform(0, 3))
-    consecutive_fail = 0
-    while not stop_event.is_set():
-        flow = None
-        try:
-            flow = RegisterFlow(
-                proxy=os.getenv("PROXY", "").strip(),
-                impersonate=shared_impersonate,
-            )
-            result = flow.register_one()
-            consecutive_fail = 0
-        except RegistrationError as exc:
-            msg = str(exc)
-            print(f"[-] 注册失败: {msg[:160]}")
-            consecutive_fail += 1
-            low = msg.lower()
-            # 脏号已 retire：短退避即可换下一个；429 必须长退避避免烧 IP
-            if "429" in low or "too many requests" in low:
-                time.sleep(min(60, 10 * consecutive_fail))
-            elif "not signup-ready" in low or "login_password" in low:
-                time.sleep(1)
-            else:
-                time.sleep(min(15, 2 * consecutive_fail))
-            continue
-        except Exception as exc:
-            print(f"[-] 异常: {str(exc)[:160]}")
-            consecutive_fail += 1
-            time.sleep(min(20, 3 * consecutive_fail))
-            continue
-        finally:
-            if flow is not None:
-                flow.close()
+def _run_once(proxy: str):
+    flow = RegisterFlow(proxy=proxy)
+    _live_flows.append(flow)
+    try:
+        result = flow.register_one()
+    except RegistrationError as exc:
+        print(f"[-] 注册失败: {str(exc)[:240]}")
+        return None, str(exc)
+    except Exception as exc:
+        print(f"[-] 异常: {str(exc)[:240]}")
+        return None, str(exc)
 
-        with file_lock:
-            global success_count
-            if success_count >= target_count:
-                stop_event.set()
-                return
-            try:
-                line = format_account_record(
-                    result.email, result.password, result.access_token
-                )
-                with open(output_file, "a", encoding="utf-8") as f:
-                    f.write(result.access_token + "\n")
-                with open(accounts_file, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception as write_err:
-                print(f"[-] 写入失败: {write_err}")
-                continue
-
-            success_count += 1
-            avg = (time.time() - start_time) / max(success_count, 1)
-            token_preview = result.access_token[:18] + "..."
-            print(
-                f"[✓] 注册成功: {success_count}/{target_count} | "
-                f"{result.email} | AT: {token_preview} | 平均: {avg:.1f}s"
-            )
-            if success_count >= target_count:
-                stop_event.set()
-                return
+    return result, ""
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ChatGPT 批量注册机")
+    p = argparse.ArgumentParser(
+        description="ChatGPT 注册 + Sub2API 导入（浏览器保活，不自动关闭）"
+    )
     p.add_argument(
         "-w",
         "--workers",
         type=int,
         default=None,
-        help="并发数；也可用环境变量 GPT_WORKERS",
+        help="忽略：保活模式固定串行 1",
     )
-    p.add_argument(
-        "-n",
-        "--total",
-        type=int,
-        default=None,
-        help="注册数量；也可用环境变量 GPT_TOTAL",
-    )
-    p.add_argument(
-        "--yes",
-        action="store_true",
-        help="非交互：缺失参数时用默认值，不读 stdin",
-    )
+    p.add_argument("-n", "--total", type=int, default=None, help="数量")
+    p.add_argument("--yes", action="store_true", help="非交互")
     return p.parse_args()
 
 
-def _resolve_int(cli_value: int | None, env_name: str, default: int, *, non_interactive: bool, prompt: str) -> int:
+def _resolve_int(
+    cli_value: int | None,
+    env_name: str,
+    default: int,
+    *,
+    non_interactive: bool,
+    prompt: str,
+) -> int:
     if cli_value is not None:
         return max(1, cli_value)
     env_raw = (os.getenv(env_name) or "").strip()
@@ -136,55 +79,109 @@ def _resolve_int(cli_value: int | None, env_name: str, default: int, *, non_inte
         return default
 
 
-def main() -> None:
-    global target_count, output_file, accounts_file, shared_impersonate, start_time
+def _should_hold_browsers(*, non_interactive: bool) -> bool:
+    """是否在成功后挂起进程保活浏览器。
 
+    Why: 本机调试常要 hold；VDS 无值守应 BROWSER_HOLD=0 成功即退出。
+    默认：有 TTY 且未显式关闭 → hold；--yes/无 TTY → 不 hold。
+    """
+    raw = (os.getenv("BROWSER_HOLD") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return not non_interactive
+
+
+def _hold_browsers() -> None:
+    """进程保活：不 close 浏览器，直到 Ctrl+C。"""
+    print()
+    print("=" * 60)
+    print("[*] 浏览器保持打开（ChatGPT 登录页 + Sub2API 等 tab）")
+    print("[*] 永不自动关闭。按 Ctrl+C 结束进程。")
+    print("[*] VDS 无值守请设 BROWSER_HOLD=0")
+    print("=" * 60)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n[*] 收到 Ctrl+C：进程退出（浏览器随进程结束）")
+
+
+def main() -> None:
     args = _parse_args()
     non_interactive = bool(args.yes or not os.isatty(0))
+    hold = _should_hold_browsers(non_interactive=non_interactive)
 
     print("=" * 60)
-    print("ChatGPT 注册机")
+    print("ChatGPT 注册 + Sub2API 导入（浏览器保活）")
     print("=" * 60)
-    print("[*] 初始化（探测 TLS 指纹）...")
+    print("[*] ChatGPT 主 tab 保活；Sub2API / OAuth 另开 tab")
     proxy = os.getenv("PROXY", "").strip()
-    shared_impersonate = pick_impersonate(proxy)
-    print(f"[+] impersonate={shared_impersonate}")
-
-    workers = _resolve_int(
-        args.workers,
-        "GPT_WORKERS",
-        3,
-        non_interactive=non_interactive,
-        prompt="\n并发数 (默认3): ",
+    headless = (os.getenv("BROWSER_HEADLESS") or "0").strip()
+    print(f"[*] PROXY={'set' if proxy else 'none'} BROWSER_HEADLESS={headless}")
+    print(f"[*] BROWSER_HOLD={'1' if hold else '0'}")
+    print(
+        f"[*] SUB2API_BASE_URL="
+        f"{(os.getenv('SUB2API_BASE_URL') or 'https://api4kimi8.org').rstrip('/')}"
     )
+
     total = _resolve_int(
         args.total,
         "GPT_TOTAL",
-        10,
+        1,
         non_interactive=non_interactive,
-        prompt="注册数量 (默认10): ",
+        prompt="注册数量 (默认1): ",
     )
-
-    target_count = total
-    workers = max(1, min(workers, target_count))
+    if args.workers and args.workers > 1:
+        print("[!] 保活模式强制串行 workers=1（忽略 -w）")
 
     os.makedirs("keys", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"keys/gpt_{ts}_{target_count}.txt"
-    accounts_file = f"keys/gpt_{ts}_{target_count}_accounts.txt"
+    output_file = f"keys/gpt_{ts}_{total}.txt"
+    accounts_file = f"keys/gpt_{ts}_{total}_accounts.txt"
     start_time = time.time()
 
-    print(f"[*] 启动 {workers} 个线程，目标 {target_count} 个")
-    print(f"[*] Token 输出: {output_file}")
-    print(f"[*] 账号表: {accounts_file}  (email|password|access_token)")
-    print("[*] 成功后将在同一 session 请求 https://chatgpt.com/api/auth/session")
+    print(f"[*] 串行目标 {total} 个")
+    print(f"[*] 账号表: {accounts_file}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(register_worker) for _ in range(workers)]
-        concurrent.futures.wait(futures)
+    success = 0
+    for i in range(total):
+        print(f"\n>>> 第 {i + 1}/{total} 次 <<<")
+        result, err = _run_once(proxy)
+        if result is None:
+            # 失败也不关已有浏览器；继续下一轮会再开新浏览器
+            continue
+        try:
+            token = result.access_token or "no-token"
+            line = format_account_record(result.email, result.password, token)
+            with open(accounts_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            if result.access_token:
+                with open(output_file, "a", encoding="utf-8") as f:
+                    f.write(result.access_token + "\n")
+        except Exception as write_err:
+            print(f"[-] 写入失败: {write_err}")
+            continue
+        success += 1
+        avg = (time.time() - start_time) / max(success, 1)
+        flag = "imported" if result.imported else "registered"
+        print(f"[✓] 成功 {success}/{total} | {result.email} | {flag} | 平均: {avg:.1f}s")
 
-    print(f"\n[*] 完成: 成功 {success_count}/{target_count}")
+    print(f"\n[*] 本轮完成: 成功 {success}/{total}")
+    if _live_flows and hold:
+        _hold_browsers()
+    elif _live_flows:
+        print("[*] BROWSER_HOLD=0：保留浏览器进程句柄至退出，不挂起等待")
+        print("[*] 进程即将结束（浏览器会随进程关闭）")
+    else:
+        print("[*] 无存活浏览器，直接退出")
 
 
 if __name__ == "__main__":
+    # 忽略管道关闭等，避免误杀保活
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
     main()
